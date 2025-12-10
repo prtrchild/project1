@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Secure Audio Art FX</title>
+    
+    <!-- CSP 정책 완화 (WebAssembly 및 Blob 허용) -->
+    <meta http-equiv="Content-Security-Policy" content="
+        default-src 'self';
+        script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdn.jsdelivr.net blob:;
+        style-src 'self' 'unsafe-inline';
+        img-src 'self' data: blob:;
+        media-src 'self' blob:;
+        connect-src 'self' https://cdn.jsdelivr.net https://mediapipe.googleapis.com data: blob:;
+        object-src 'none';
+        base-uri 'self';
+    ">
+
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Segoe UI', sans-serif; user-select: none; -webkit-user-select: none; }
+        #gl-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; pointer-events: none; }
+        
+        /* 보안 잠금 화면 */
+        #security-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; z-index: 9999;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            color: #fff;
+        }
+        #security-box {
+            background: #111; padding: 30px; border: 1px solid #333; border-radius: 10px;
+            text-align: center; box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+        #pass-input {
+            padding: 10px; border-radius: 4px; border: 1px solid #444; background: #222; color: #fff;
+            margin-top: 15px; width: 200px; text-align: center; letter-spacing: 5px; font-size: 18px;
+        }
+        #pass-btn {
+            margin-top: 15px; padding: 10px 20px; background: #ffae00; border: none; border-radius: 4px;
+            color: #000; font-weight: bold; cursor: pointer; transition: 0.2s;
+        }
+        #pass-btn:hover { background: #ffcc00; }
+        .error-msg { color: #ff4444; font-size: 12px; margin-top: 10px; display: none; }
+
+        /* UI */
+        #camera-container {
+            position: fixed; top: 10px; right: 10px; 
+            width: 360px; height: auto;
+            z-index: 100; background: #000; border: 1px solid #444; border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            resize: both; overflow: hidden; min-width: 240px; max-width: 90vw;
+            display: flex; flex-direction: column;
+            visibility: hidden; 
+        }
+        #camera-header {
+            width: 100%; height: 24px; background: #333; cursor: grab;
+            display: flex; align-items: center; justify-content: center;
+            color: #aaa; font-size: 14px; user-select: none; flex-shrink: 0;
+        }
+        #camera-content { position: relative; width: 100%; height: 100%; flex-grow: 1; background: #000; }
+        #input-video { transform: scaleX(-1); display: block; width: 100%; height: 100%; object-fit: cover; opacity: 0.5; }
+        #debug-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: fill; }
+
+        #audio-controls {
+            position: fixed; bottom: 20px; left: 20px; z-index: 200;
+            background: rgba(0,0,0,0.85); padding: 20px; border-radius: 12px; border: 1px solid #555;
+            color: white; display: flex; flex-direction: column; gap: 12px; width: 320px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.8);
+            backdrop-filter: blur(5px);
+            visibility: hidden; 
+        }
+        .guide-item { display: flex; justify-content: space-between; border-bottom: 1px solid #444; padding: 6px 0; font-size: 13px; color: #ddd; }
+        .guide-item span:first-child { font-weight: bold; color: #ffae00; }
+        .audio-status { font-size: 13px; color: #00ffaa; font-weight: bold; margin-top: 5px; text-align: center; }
+        
+        #loading-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; color: #fff; z-index: 300;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            transition: opacity 0.5s;
+            display: none; 
+        }
+        .loader { border: 4px solid #333; border-top: 4px solid #ffae00; border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin-bottom: 20px;}
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        
+        .lil-gui.root { position: fixed; top: 10px; left: 10px; z-index: 11; visibility: hidden; }
+    </style>
+</head>
+<body oncontextmenu="return false;">
+
+    <!-- 보안 잠금 화면 -->
+    <div id="security-overlay">
+        <div id="security-box">
+            <h2 style="margin:0 0 10px 0; color:#ffae00;">SECURE ACCESS</h2>
+            <p style="font-size:13px; color:#aaa; margin-bottom:20px;">접속 코드를 입력하세요.</p>
+            <input type="password" id="pass-input" placeholder="CODE" />
+            <br>
+            <button id="pass-btn">ENTER</button>
+            <div id="error-msg" class="error-msg">Access Denied.</div>
+        </div>
+    </div>
+
+    <!-- 라이브러리 -->
+    <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+    <script src="https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.umd.min.js"></script>
+    <script src="https://unpkg.com/stats.js@0.17.0/build/stats.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <!-- UI -->
+    <div id="audio-controls">
+        <strong style="color:#ffae00; font-size:16px; text-align:center; display:block; margin-bottom:5px;">AUDIO ART FX</strong>
+        <div class="guide-item">
+            <span>✊ 오른손 주먹 (Filter)</span> 
+            <span>중앙으로 빨려듦 (Condense)</span>
+        </div>
+        <div class="guide-item">
+            <span>👌 오른손 핀치 (Pan)</span> 
+            <span>바람 이동 (놓으면 복귀)</span>
+        </div>
+        <div class="guide-item">
+            <span>✋ 왼손 펴기 (Reverb)</span> 
+            <span>자유분방한 확산</span>
+        </div>
+        <div class="guide-item">
+            <span>↔ 양손 거리 (Flanger)</span> 
+            <span>색상 글리치</span>
+        </div>
+        
+        <input type="file" id="audio-file" accept="audio/*" style="margin-top:10px;" />
+        <audio id="music-player" controls loop style="width: 100%; display:none; margin-top:5px;"></audio>
+        <div id="audio-status" class="audio-status">음악 파일을 선택해주세요</div>
+    </div>
+
+    <div id="loading-overlay">
+        <div class="loader"></div>
+        <div id="status-text">Engine Initializing...</div>
+        <small id="status-sub" style="color:#666; margin-top:10px;">Checking Permissions...</small>
+    </div>
+
+    <canvas id="gl-canvas"></canvas>
+
+    <div id="camera-container">
+        <div id="camera-header">::: Vision Debug :::</div>
+        <div id="camera-content">
+            <video id="input-video" playsinline></video>
+            <canvas id="debug-canvas"></canvas>
+        </div>
+    </div>
+
+    <script>
+        // --- [보안] 비밀번호 체크 (Improved) ---
+        async function checkPassword() {
+            let input = document.getElementById('pass-input').value;
+            const errorMsg = document.getElementById('error-msg');
+            
+            // 공백 제거 (모바일 입력 오류 방지)
+            input = input.trim();
+
+            // "6458"의 SHA-256 해시값
+            const correctHash = "6404944883b2767096d2b347f30009c99684347732a39223304a37b34e2c9438"; 
+            
+            try {
+                // HTTPS 환경이 아니면 crypto.subtle이 없을 수 있음 -> 단순 비교로 fallback
+                if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+                    // 보안 컨텍스트가 아닐 경우 (로컬 파일 등) -> 임시로 단순 문자열 비교 허용
+                    if (input === "6458") {
+                        unlockApp();
+                        return;
+                    }
+                }
+
+                const msgBuffer = new TextEncoder().encode(input);
+                const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+                if (hashHex === correctHash) {
+                    unlockApp();
+                } else {
+                    throw new Error("Wrong Password");
+                }
+            } catch (e) {
+                errorMsg.style.display = 'block';
+                errorMsg.innerText = "Access Denied.";
+                document.getElementById('pass-input').value = "";
+                console.error("Login Failed:", e);
+            }
+        }
+
+        function unlockApp() {
+            document.getElementById('security-overlay').style.display = 'none';
+            document.getElementById('loading-overlay').style.display = 'flex';
+            
+            document.getElementById('camera-container').style.visibility = 'visible';
+            document.getElementById('audio-controls').style.visibility = 'visible';
+            document.querySelector('.lil-gui.root').style.visibility = 'visible';
+            
+            startApp();
+        }
+
+        document.getElementById('pass-btn').addEventListener('click', checkPassword);
+        document.getElementById('pass-input').addEventListener('keypress', (e) => {
+            if(e.key === 'Enter') checkPassword();
+        });
+
+        // --- 앱 시작 ---
+        function startApp() {
+            initThree();
+            initUI();
+            initDraggable();
+            
+            try {
+                initMediaPipe();
+            } catch (e) {
+                alert("AI Engine Error: " + e.message);
+                document.getElementById('loading-overlay').style.display = 'none';
+            }
+            
+            animate();
+        }
+
+        // --- 기존 로직 ---
+
+        const AudioEngine = {
+            ctx: null, source: null, gainNode: null,
+            filterNode: null, pannerNode: null, convolverNode: null, reverbGain: null,
+            flangerDelay: null, flangerMix: null, flangerOsc: null,
+            isInit: false,
+
+            init(audioElement) {
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                this.ctx = new AudioContext();
+                this.source = this.ctx.createMediaElementSource(audioElement);
+                this.gainNode = this.ctx.createGain();
+                
+                this.filterNode = this.ctx.createBiquadFilter();
+                this.filterNode.type = 'lowpass';
+                this.filterNode.frequency.value = 20000; 
+
+                this.pannerNode = this.ctx.createStereoPanner();
+                this.pannerNode.pan.value = 0;
+
+                this.convolverNode = this.ctx.createConvolver();
+                this.reverbGain = this.ctx.createGain();
+                this.reverbGain.gain.value = 0; 
+                this.createReverbImpulse(); 
+
+                this.flangerDelay = this.ctx.createDelay();
+                this.flangerDelay.delayTime.value = 0.005;
+                this.flangerOsc = this.ctx.createOscillator();
+                this.flangerOsc.frequency.value = 0.5; 
+                const flangerOscGain = this.ctx.createGain();
+                flangerOscGain.gain.value = 0.002;
+                this.flangerOsc.connect(flangerOscGain);
+                flangerOscGain.connect(this.flangerDelay.delayTime);
+                this.flangerOsc.start();
+                this.flangerMix = this.ctx.createGain();
+                this.flangerMix.gain.value = 0;
+
+                this.source.connect(this.filterNode);
+                this.filterNode.connect(this.pannerNode);
+                this.pannerNode.connect(this.gainNode);
+                
+                this.pannerNode.connect(this.convolverNode); 
+                this.convolverNode.connect(this.reverbGain);
+                this.reverbGain.connect(this.gainNode);
+                
+                this.pannerNode.connect(this.flangerDelay);
+                this.flangerDelay.connect(this.flangerMix);
+                this.flangerMix.connect(this.gainNode);
+
+                this.gainNode.connect(this.ctx.destination);
+                this.isInit = true;
+            },
+
+            createReverbImpulse() {
+                const rate = this.ctx.sampleRate;
+                const length = rate * 3.0; 
+                const impulse = this.ctx.createBuffer(2, length, rate);
+                const l = impulse.getChannelData(0); const r = impulse.getChannelData(1);
+                for (let i = 0; i < length; i++) {
+                    const decay = Math.pow(1 - i / length, 3.0);
+                    l[i] = (Math.random() * 2 - 1) * decay;
+                    r[i] = (Math.random() * 2 - 1) * decay;
+                }
+                this.convolverNode.buffer = impulse;
+            },
+
+            update(state) {
+                if (!this.isInit) return;
+                const t = this.ctx.currentTime;
+                const ramp = 0.1;
+
+                const targetFreq = 200 + (20000 - 200) * (1.0 - state.rtTension);
+                this.filterNode.frequency.setTargetAtTime(targetFreq, t, ramp);
+
+                const pan = (state.panVal - 0.5) * 2.0; 
+                this.pannerNode.pan.setTargetAtTime(pan, t, ramp);
+
+                const reverbAmt = (1.0 - state.ltTension) * 3.0; 
+                this.reverbGain.gain.setTargetAtTime(reverbAmt, t, ramp);
+
+                let flangerAmt = 1.0 - (state.handDist / 0.5); 
+                flangerAmt = Math.max(0, Math.min(1, flangerAmt)); 
+                this.flangerMix.gain.setTargetAtTime(flangerAmt, t, ramp);
+            }
+        };
+
+        document.getElementById('audio-file').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            const player = document.getElementById('music-player');
+            const status = document.getElementById('audio-status');
+            if (file) {
+                player.src = URL.createObjectURL(file);
+                player.style.display = 'block';
+                status.innerText = "▶ Now Playing: " + file.name;
+                status.style.color = "#00ffaa";
+                if (!AudioEngine.isInit) AudioEngine.init(player);
+                player.play();
+                if (AudioEngine.ctx && AudioEngine.ctx.state === 'suspended') AudioEngine.ctx.resume();
+            }
+        });
+
+        function initDraggable() {
+            const container = document.getElementById('camera-container');
+            const header = document.getElementById('camera-header');
+            let isDragging = false, startX, startY;
+            header.addEventListener('mousedown', (e) => {
+                isDragging = true; startX = e.clientX; startY = e.clientY;
+                const rect = container.getBoundingClientRect();
+                container.style.left = rect.left + 'px'; container.style.top = rect.top + 'px';
+                container.style.right = 'auto'; container.style.bottom = 'auto';
+            });
+            window.addEventListener('mousemove', (e) => {
+                if (!isDragging) return;
+                const dx = e.clientX - startX; const dy = e.clientY - startY;
+                container.style.left = (parseInt(container.style.left||0) + dx) + 'px';
+                container.style.top = (parseInt(container.style.top||0) + dy) + 'px';
+                startX = e.clientX; startY = e.clientY;
+            });
+            window.addEventListener('mouseup', () => isDragging = false);
+        }
+
+        const CONFIG = {
+            maxLines: 200,       
+            segments: 50,        
+            colorA: '#ffaa00',   
+            colorB: '#ff0055'    
+        };
+
+        const STATE = {
+            rtTension: 0, 
+            ltTension: 1,   
+            panVal: 0.5,    
+            handDist: 1.0,  
+            flangerVal: 0.0, 
+            isRtPinching: false,
+            hasCamera: false
+        };
+
+        let scene, camera, renderer, lineSegments;
+        let simPositions, lineHeads, lineProps;
+        let material; 
+
+        function initThree() {
+            const canvas = document.getElementById('gl-canvas');
+            renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            
+            scene = new THREE.Scene(); 
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 80; 
+            
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix(); 
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+
+            createTrails();
+        }
+
+        function createTrails() {
+            if (lineSegments) {
+                scene.remove(lineSegments);
+                lineSegments.geometry.dispose();
+            }
+
+            const segsPerLine = CONFIG.segments - 1;
+            const vertexCount = CONFIG.maxLines * segsPerLine * 2;
+            
+            const positions = new Float32Array(vertexCount * 3);
+            const opacities = new Float32Array(vertexCount);
+            const mixAttrib = new Float32Array(vertexCount);
+            
+            simPositions = new Float32Array(CONFIG.maxLines * CONFIG.segments * 3);
+            lineHeads = [];
+            lineProps = [];
+
+            for (let i = 0; i < CONFIG.maxLines; i++) {
+                lineHeads.push({ x: 0, y: 0, z: 0 });
+                lineProps.push({
+                    speed: 0.5 + Math.random() * 0.8,
+                    offset: Math.random() * 100,
+                    mix: Math.random() 
+                });
+
+                const lineStartIdx = i * segsPerLine * 2;
+                const m = lineProps[i].mix;
+                
+                for (let s = 0; s < segsPerLine; s++) {
+                    const idx = lineStartIdx + s * 2;
+                    opacities[idx] = 1.0 - (s / segsPerLine);
+                    opacities[idx+1] = 1.0 - ((s+1) / segsPerLine);
+                    mixAttrib[idx] = m;
+                    mixAttrib[idx+1] = m;
+                }
+            }
+
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('alpha', new THREE.BufferAttribute(opacities, 1));
+            geometry.setAttribute('mixFactor', new THREE.BufferAttribute(mixAttrib, 1));
+
+            material = new THREE.ShaderMaterial({
+                uniforms: {
+                    uTime: { value: 0 },
+                    uColorA: { value: new THREE.Color(CONFIG.colorA) },
+                    uColorB: { value: new THREE.Color(CONFIG.colorB) },
+                    uFlanger: { value: 0.0 },
+                    uDensityReduction: { value: 0.0 }
+                },
+                vertexShader: `
+                    attribute float alpha;
+                    attribute float mixFactor;
+                    varying float vAlpha;
+                    varying vec3 vColor;
+                    
+                    uniform vec3 uColorA;
+                    uniform vec3 uColorB;
+                    uniform float uTime;
+                    uniform float uFlanger;
+                    uniform float uDensityReduction;
+
+                    void main() {
+                        vAlpha = alpha * (1.0 - uDensityReduction);
+                        vec3 baseColor = mix(uColorA, uColorB, mixFactor);
+                        
+                        if (uFlanger > 0.01) {
+                            float noise = sin(uTime * 15.0 + mixFactor * 30.0);
+                            vec3 glitch = vec3(
+                                sin(uTime * 5.0 + mixFactor * 10.0),
+                                sin(uTime * 8.0 - mixFactor * 10.0),
+                                sin(uTime * 3.0 + mixFactor * 20.0)
+                            );
+                            baseColor += glitch * uFlanger * 0.8;
+                        }
+                        vColor = clamp(baseColor, 0.0, 1.0);
+                        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                        gl_Position = projectionMatrix * mvPosition;
+                    }
+                `,
+                fragmentShader: `
+                    varying float vAlpha;
+                    varying vec3 vColor;
+                    void main() {
+                        gl_FragColor = vec4(vColor, vAlpha);
+                    }
+                `,
+                transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
+            });
+
+            lineSegments = new THREE.LineSegments(geometry, material);
+            scene.add(lineSegments);
+        }
+
+        function updateTrails(time) {
+            if (!simPositions || !lineSegments) return;
+
+            const positions = lineSegments.geometry.attributes.position.array;
+            const tension = STATE.rtTension; 
+            const panDir = (STATE.panVal - 0.5) * 2.0;
+
+            const flangerVal = Math.max(0, 1.0 - (STATE.handDist / 0.5));
+            STATE.flangerVal = flangerVal;
+            material.uniforms.uFlanger.value = flangerVal;
+            material.uniforms.uDensityReduction.value = tension * 0.5;
+
+            const targetRadius = 45.0 * (1.0 - tension) + 5.0 * tension; 
+            const targetAmp = 1.0 * (1.0 - tension * 0.3); 
+            const chaosFactor = (1.0 - STATE.ltTension) * 2.0; 
+
+            for (let i = 0; i < CONFIG.maxLines; i++) {
+                const prop = lineProps[i];
+                const speed = prop.speed; 
+                const t = time * speed + prop.offset;
+
+                let ox = (Math.sin(t * 0.9) + Math.cos(t * 1.4));
+                let oy = (Math.cos(t * 0.7) + Math.sin(t * 2.2));
+                let oz = Math.sin(t * 0.5);
+
+                let wx = 0, wy = 0, wz = 0;
+                wx += Math.sin(t * 2.0 + i) * 2.0;
+                wy += Math.cos(t * 2.5 + i) * 2.0;
+                wz += Math.sin(t * 3.0 + i) * 2.0;
+
+                if (chaosFactor > 0.01) {
+                    wx += (Math.sin(t*5 + i) * chaosFactor * 5.0);
+                    wy += (Math.cos(t*4 + i) * chaosFactor * 5.0);
+                    wz += (Math.sin(t*6 + i) * chaosFactor * 5.0);
+                }
+
+                let x = ox * targetRadius + wx * targetAmp;
+                let y = oy * targetRadius + wy * targetAmp;
+                let z = oz * targetRadius + wz * targetAmp;
+
+                x += panDir * 45.0;
+                if (Math.abs(panDir) > 0.1) {
+                    const stream = Math.sin(t * 15.0 + y * 0.2); 
+                    x += stream * (panDir * 5.0);
+                }
+
+                const segCount = CONFIG.segments;
+                const lineStartIdx = i * segCount * 3;
+                
+                for (let k = segCount - 1; k > 0; k--) {
+                    const c = lineStartIdx + k * 3;
+                    const p = lineStartIdx + (k - 1) * 3;
+                    simPositions[c] = simPositions[p];
+                    simPositions[c+1] = simPositions[p+1];
+                    simPositions[c+2] = simPositions[p+2];
+                }
+                simPositions[lineStartIdx] = x;
+                simPositions[lineStartIdx+1] = y;
+                simPositions[lineStartIdx+2] = z;
+
+                const rStart = i * (segCount - 1) * 2 * 3;
+                for (let k = 0; k < segCount - 1; k++) {
+                    const sA = lineStartIdx + k * 3;
+                    const sB = lineStartIdx + (k + 1) * 3;
+                    const r = rStart + k * 6;
+                    
+                    positions[r] = simPositions[sA]; positions[r+1] = simPositions[sA+1]; positions[r+2] = simPositions[sA+2];
+                    positions[r+3] = simPositions[sB]; positions[r+4] = simPositions[sB+1]; positions[r+5] = simPositions[sB+2];
+                }
+            }
+            lineSegments.geometry.attributes.position.needsUpdate = true;
+        }
+
+        function initUI() {
+            const gui = new lil.GUI({ title: 'Settings' });
+            
+            gui.addColor(CONFIG, 'colorA').name('Color A').onChange(c => {
+                if(material) material.uniforms.uColorA.value.set(c);
+            });
+            gui.addColor(CONFIG, 'colorB').name('Color B').onChange(c => {
+                if(material) material.uniforms.uColorB.value.set(c);
+            });
+            gui.add(CONFIG, 'maxLines', 50, 1000, 50).name('Max Lines').onFinishChange(() => {
+                createTrails(); 
+            });
+        }
+
+        const videoElement = document.getElementById('input-video');
+        const debugCanvas = document.getElementById('debug-canvas');
+        const debugCtx = debugCanvas.getContext('2d');
+        let handsDetector, lastDetectionTime = 0;
+
+        function initMediaPipe() {
+            handsDetector = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+            handsDetector.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.5 });
+            handsDetector.onResults(onHandsResults);
+            
+            const cameraUtils = new Camera(videoElement, {
+                onFrame: async () => {
+                    const now = performance.now();
+                    if (now - lastDetectionTime > 35) { 
+                        await handsDetector.send({image: videoElement}); 
+                        lastDetectionTime = now;
+                    }
+                }, width: 320, height: 240
+            });
+            cameraUtils.start().then(() => {
+                document.getElementById('loading-overlay').style.display = 'none';
+            }).catch(err => {
+                console.error(err);
+                document.getElementById('status-text').innerText = "Camera Failed";
+                document.getElementById('status-sub').innerText = "Check permissions or use HTTPS.";
+            });
+        }
+
+        function onHandsResults(results) {
+            debugCanvas.width = videoElement.videoWidth; 
+            debugCanvas.height = videoElement.videoHeight;
+            debugCtx.clearRect(0, 0, debugCanvas.width, debugCanvas.height);
+            
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                processGestures(results.multiHandLandmarks, results.multiHandedness);
+                drawHUD(results.multiHandLandmarks, results.multiHandedness);
+            } else {
+                STATE.rtTension = lerp(STATE.rtTension, 0, 0.1);
+                STATE.ltTension = lerp(STATE.ltTension, 1, 0.1); 
+                STATE.isRtPinching = false;
+                STATE.panVal = lerp(STATE.panVal, 0.5, 0.1);
+            }
+        }
+
+        function processGestures(landmarksArray, handednessArray) {
+            let leftWrist = null, rightWrist = null;
+            let foundR = false, foundL = false;
+
+            for (let i = 0; i < landmarksArray.length; i++) {
+                const lm = landmarksArray[i];
+                const label = handednessArray[i].label; 
+
+                if (label === 'Left') { // User's Right Hand
+                    foundR = true;
+                    rightWrist = lm[0];
+                    const d = distance(lm[0], lm[12]);
+                    const rawTension = map(d, 0.15, 0.45, 1.0, 0.0);
+                    STATE.rtTension = lerp(STATE.rtTension, clamp(rawTension, 0, 1), 0.2);
+
+                    const pinchD = distance(lm[4], lm[8]);
+                    STATE.isRtPinching = (pinchD < 0.06);
+                    if (STATE.isRtPinching) {
+                        const visualX = 1.0 - lm[8].x;
+                        STATE.panVal = lerp(STATE.panVal, visualX, 0.15);
+                    } else {
+                        STATE.panVal = lerp(STATE.panVal, 0.5, 0.1); // Auto-Center
+                    }
+                }
+                
+                if (label === 'Right') { // User's Left Hand
+                    foundL = true;
+                    leftWrist = lm[0];
+                    const d = distance(lm[0], lm[12]);
+                    const rawTension = map(d, 0.15, 0.45, 1.0, 0.0);
+                    STATE.ltTension = lerp(STATE.ltTension, clamp(rawTension, 0, 1), 0.2);
+                }
+            }
+            
+            if (!foundR) STATE.panVal = lerp(STATE.panVal, 0.5, 0.1);
+
+            if (foundL && foundR) {
+                STATE.handDist = lerp(STATE.handDist, distance(leftWrist, rightWrist), 0.1);
+            } else {
+                STATE.handDist = lerp(STATE.handDist, 1.0, 0.05);
+            }
+        }
+
+        function drawHUD(landmarksArray, handednessArray) {
+            const ctx = debugCtx;
+            const w = debugCanvas.width;
+            const h = debugCanvas.height;
+            const getPos = (pt) => ({x: w * (1-pt.x), y: h * pt.y}); 
+
+            ctx.save();
+            ctx.shadowColor = "rgba(0,0,0,0.8)"; ctx.shadowBlur = 4;
+            ctx.font = "bold 14px Segoe UI";
+
+            let lPos = null, rPos = null;
+
+            landmarksArray.forEach((lm, i) => {
+                const label = handednessArray[i].label;
+                const wrist = getPos(lm[0]);
+
+                ctx.strokeStyle = "rgba(255,255,255,0.3)"; ctx.lineWidth = 1;
+                for(const [s,e] of HAND_CONNECTIONS) {
+                    const p1 = getPos(lm[s]); const p2 = getPos(lm[e]);
+                    ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+                }
+
+                if (label === 'Left') { // RIGHT HAND
+                    rPos = wrist;
+                    const radius = 30 * (1.2 - STATE.rtTension * 0.5);
+                    ctx.beginPath(); ctx.arc(wrist.x, wrist.y, radius, 0, Math.PI*2);
+                    ctx.strokeStyle = STATE.rtTension > 0.7 ? '#ff0000' : '#ffae00';
+                    ctx.lineWidth = 3; ctx.stroke();
+                    
+                    const filterPct = Math.round(STATE.rtTension * 100);
+                    ctx.fillStyle = "#fff"; ctx.fillText(`FILTER: ${filterPct}%`, wrist.x-35, wrist.y-radius-10);
+
+                    // PANNING
+                    if (STATE.isRtPinching) {
+                        const centerX = w / 2;
+                        const indexTip = getPos(lm[8]); 
+                        
+                        ctx.beginPath();
+                        ctx.moveTo(centerX, 0); ctx.lineTo(centerX, h);
+                        ctx.strokeStyle = "rgba(0, 255, 255, 0.3)"; ctx.lineWidth = 1;
+                        ctx.setLineDash([5, 5]); ctx.stroke(); ctx.setLineDash([]);
+                        
+                        ctx.beginPath();
+                        ctx.moveTo(centerX, indexTip.y); ctx.lineTo(indexTip.x, indexTip.y);
+                        ctx.strokeStyle = "#00ffff"; ctx.lineWidth = 3; ctx.stroke();
+                        
+                        ctx.beginPath(); ctx.arc(indexTip.x, indexTip.y, 6, 0, Math.PI*2);
+                        ctx.fillStyle = "#00ffff"; ctx.fill();
+
+                        const panVisual = (STATE.panVal - 0.5) * 2.0; 
+                        const dir = panVisual < 0 ? 'L' : 'R';
+                        const val = Math.round(Math.abs(panVisual) * 100);
+                        const labelText = Math.abs(panVisual) < 0.1 ? "CENTER" : `${dir} ${val}%`;
+
+                        ctx.fillStyle = "#00ffff"; 
+                        ctx.font = "bold 16px Arial";
+                        ctx.fillText(`PAN: ${labelText}`, indexTip.x - 40, indexTip.y + 40);
+                    }
+                }
+
+                if (label === 'Right') { // LEFT HAND
+                    lPos = wrist;
+                    const chaos = (1.0 - STATE.ltTension); 
+                    ctx.beginPath(); ctx.arc(wrist.x, wrist.y, 25, 0, Math.PI*2);
+                    ctx.fillStyle = `rgba(255, 0, 255, ${chaos * 0.5})`; ctx.fill();
+                    ctx.strokeStyle = '#ff00ff'; ctx.stroke();
+                    
+                    const revPct = Math.round(chaos * 100);
+                    ctx.fillStyle = "#fff"; ctx.fillText(`REVERB: ${revPct}%`, wrist.x-35, wrist.y-40);
+                }
+            });
+
+            if (lPos && rPos) {
+                ctx.beginPath(); ctx.moveTo(lPos.x, lPos.y); ctx.lineTo(rPos.x, rPos.y);
+                ctx.strokeStyle = "#ffffff"; ctx.setLineDash([5, 5]); ctx.lineWidth = 2; ctx.stroke();
+                ctx.setLineDash([]);
+
+                const cx = (lPos.x + rPos.x) / 2;
+                const cy = (lPos.y + rPos.y) / 2;
+                const flangerVal = Math.round(STATE.flangerVal * 100);
+                
+                ctx.fillStyle = "#ffffff"; ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI*2); ctx.fill();
+                ctx.fillStyle = "#00ffaa"; ctx.font = "bold 14px Arial";
+                ctx.fillText(`FLANGER ${flangerVal}%`, cx - 40, cy - 15);
+            }
+
+            ctx.restore();
+        }
+
+        function lerp(a,b,t) { return (1-t)*a + t*b; }
+        function distance(a,b) { return Math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2); }
+        function map(v, iMin, iMax, oMin, oMax) { return oMin + (oMax - oMin) * ((v - iMin) / (iMax - iMin)); }
+        function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+        const clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+            AudioEngine.update(STATE);
+            updateTrails(clock.getElapsedTime());
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
